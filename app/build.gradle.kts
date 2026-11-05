@@ -15,6 +15,7 @@ val qwenOpencl = providers.gradleProperty("qwen.opencl")
     .orElse(false)
 val qwenOpenclSdkDir = providers.gradleProperty("qwen.opencl.sdkDir")
     .orElse(layout.projectDirectory.dir("../build/opencl-sdk").asFile.absolutePath)
+val qwenPrebuiltJniDir = providers.gradleProperty("qwen.prebuiltJniDir").orNull
 val generatedOpenmpJniLibs = layout.buildDirectory.dir("generated/openmpJniLibs")
 
 val copyOpenmpLibs by tasks.registering {
@@ -73,39 +74,47 @@ android {
         compose = true
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-        }
-    }
-
-    defaultConfig {
+    if (qwenPrebuiltJniDir == null) {
         externalNativeBuild {
             cmake {
-                targets += listOf("qwen3_tts_jni")
-                arguments += listOf(
-                    "-DANDROID_STL=c++_shared",
-                    "-DQWEN3_ANDROID_OPENMP=${if (qwenOpenmp.get()) "ON" else "OFF"}",
-                    "-DQWEN3_ANDROID_VULKAN=${if (qwenVulkan.get()) "ON" else "OFF"}",
-                    "-DQWEN3_ANDROID_OPENCL=${if (qwenOpencl.get()) "ON" else "OFF"}",
-                    "-DOpenCL_INCLUDE_DIR=${qwenOpenclSdkDir.get()}/OpenCL-Headers",
-                    "-DOpenCL_LIBRARY=${qwenOpenclSdkDir.get()}/lib/arm64-v8a/libOpenCL.so",
-                )
+                path = file("src/main/cpp/CMakeLists.txt")
+            }
+        }
+
+        defaultConfig {
+            externalNativeBuild {
+                cmake {
+                    targets += listOf("qwen3_tts_jni")
+                    arguments += listOf(
+                        "-DANDROID_STL=c++_shared",
+                        "-DQWEN3_ANDROID_OPENMP=${if (qwenOpenmp.get()) "ON" else "OFF"}",
+                        "-DQWEN3_ANDROID_VULKAN=${if (qwenVulkan.get()) "ON" else "OFF"}",
+                        "-DQWEN3_ANDROID_OPENCL=${if (qwenOpencl.get()) "ON" else "OFF"}",
+                        "-DOpenCL_INCLUDE_DIR=${qwenOpenclSdkDir.get()}/OpenCL-Headers",
+                        "-DOpenCL_LIBRARY=${qwenOpenclSdkDir.get()}/lib/arm64-v8a/libOpenCL.so",
+                    )
+                }
             }
         }
     }
 
     sourceSets {
         getByName("main") {
-            jniLibs.srcDir(generatedOpenmpJniLibs.get().asFile)
+            if (qwenPrebuiltJniDir != null) {
+                jniLibs.srcDir(rootProject.file(qwenPrebuiltJniDir))
+            } else {
+                jniLibs.srcDir(generatedOpenmpJniLibs.get().asFile)
+            }
         }
     }
 }
 
-tasks.matching {
-    it.name.startsWith("merge") && (it.name.endsWith("NativeLibs") || it.name.endsWith("JniLibFolders"))
-}.configureEach {
-    dependsOn(copyOpenmpLibs)
+if (qwenPrebuiltJniDir == null) {
+    tasks.matching {
+        it.name.startsWith("merge") && (it.name.endsWith("NativeLibs") || it.name.endsWith("JniLibFolders"))
+    }.configureEach {
+        dependsOn(copyOpenmpLibs)
+    }
 }
 
 kotlin {

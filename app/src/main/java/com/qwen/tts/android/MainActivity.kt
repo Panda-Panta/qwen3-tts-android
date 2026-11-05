@@ -155,7 +155,7 @@ private val defaultBackendOption = backendOptions.first { it.id == "cpu" }
 
 private object QwenModel {
     private const val repo = "Serveurperso/Qwen3-TTS-GGUF"
-    private const val baseUrl = "https://huggingface.co/$repo/resolve/main"
+    private const val baseUrl = "https://hf-mirror.com/$repo/resolve/main"
 
     val defaultVariant: ModelVariant = variant(
         id = "q4_k_m",
