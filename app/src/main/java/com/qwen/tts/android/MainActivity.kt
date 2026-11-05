@@ -148,10 +148,10 @@ private val languageOptions = listOf(
 )
 
 private val backendOptions = listOf(
-    BackendOption("cpu", "CPU", QwenEngine.BACKEND_CPU),
+    BackendOption("auto", "Auto (GPU/CPU)", QwenEngine.BACKEND_AUTO),
 )
 
-private val defaultBackendOption = backendOptions.first { it.id == "cpu" }
+private val defaultBackendOption = backendOptions.first { it.id == "auto" }
 
 private object QwenModel {
     private const val repo = "Serveurperso/Qwen3-TTS-GGUF"
@@ -1587,7 +1587,7 @@ private fun RuntimePanel(
                 Text("Performance", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             }
             Text(
-                "CPU backend",
+                state.activeBackendName?.let { "Backend: $it" } ?: "Backend: Auto (GPU/CPU)",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
