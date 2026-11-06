@@ -1,0 +1,36 @@
+cmake_minimum_required(VERSION 3.22)
+project(qwen_llama_tts LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+set(GGML_BACKEND_DL ON CACHE BOOL "" FORCE)
+set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "" FORCE)
+set(GGML_CPU_REPACK ON CACHE BOOL "" FORCE)
+set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+set(GGML_RPC OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN_ANDROID_DISPATCH_SOURCE "${CMAKE_CURRENT_LIST_DIR}/../turnip-dispatch.cpp")
+set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+
+find_package(SPIRV-Headers CONFIG REQUIRED)
+add_subdirectory("${LLAMA_SOURCE_DIR}" llama)
+target_link_libraries(ggml-vulkan PRIVATE SPIRV-Headers::SPIRV-Headers)
+
+foreach(runtime ggml-base ggml llama mtmd ${GGML_AVAILABLE_BACKENDS})
+    set_property(TARGET ${runtime} PROPERTY VERSION)
+    set_property(TARGET ${runtime} PROPERTY SOVERSION)
+    set_target_properties(${runtime} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${APP_JNI_DIR}")
+endforeach()
+
+# Keep Vulkan out of GGML's default scan. The app loads it only on request.
+set_target_properties(ggml-vulkan PROPERTIES OUTPUT_NAME qwen-ggml-vulkan)
+
+option(QWEN_APP_RUNTIME_ONLY "Build the llama runtime without the JNI bridge" OFF)
+if (NOT QWEN_APP_RUNTIME_ONLY)
+    add_library(qwen_llama_tts_jni SHARED ../llama-tts-jni.cpp)
+    target_link_libraries(qwen_llama_tts_jni PRIVATE llama mtmd ggml log)
+    set_target_properties(qwen_llama_tts_jni PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${APP_JNI_DIR}")
+endif()

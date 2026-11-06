@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">Qwen3 TTS</string>
+    <string name="app_name">Qwen3 TTS (llama.cpp)</string>
 </resources>
 

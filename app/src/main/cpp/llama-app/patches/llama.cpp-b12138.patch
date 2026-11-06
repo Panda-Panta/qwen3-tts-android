@@ -1,0 +1,937 @@
+diff --git a/ggml/src/ggml-vulkan/CMakeLists.txt b/ggml/src/ggml-vulkan/CMakeLists.txt
+index 682b90e1629be9bc914262849a6e7ff4004baa7e..fc145a3370306543617f50fa8cb5ca2ccd355670 100644
+--- a/ggml/src/ggml-vulkan/CMakeLists.txt
++++ b/ggml/src/ggml-vulkan/CMakeLists.txt
+@@ -123,6 +123,16 @@ if (Vulkan_FOUND)
+     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+ 
++    if (ANDROID AND GGML_VULKAN_ANDROID_DISPATCH_SOURCE)
++        target_sources(ggml-vulkan PRIVATE "${GGML_VULKAN_ANDROID_DISPATCH_SOURCE}")
++        target_link_libraries(ggml-vulkan PRIVATE dl log)
++        target_link_options(ggml-vulkan PRIVATE
++            "-Wl,--wrap=vkGetInstanceProcAddr"
++            "-Wl,--wrap=vkGetDeviceProcAddr"
++            "-Wl,--wrap=vkGetPhysicalDeviceFeatures2"
++            "-Wl,--wrap=vkCmdCopyBuffer")
++    endif()
++
+     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
+     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
+     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 3a010dbd546647f8c8563089270b89874676ea96..eba718332a30412f831e250686f589d0c6c34c86 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -772,6 +772,23 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
+         pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+     } catch (const vk::SystemError& e) {
+         std::cerr << "ggml_vulkan: compute pipeline creation failed for " << pipeline->name << ": " << e.what() << std::endl;
++        if (const char * path = getenv("GGML_VK_EXPERIMENTAL_DUMP_FAILED_SHADER")) {
++            if (FILE * file = fopen(path, "wb")) {
++                fwrite(shader_module_create_info.pCode, 1, shader_module_create_info.codeSize, file);
++                fclose(file);
++            }
++            std::cerr << "probe bindings=" << parameter_count << " push=" << pipeline->push_constant_size
++                      << " flags=" << static_cast<uint32_t>(compute_pipeline_create_info.flags)
++                      << " stage_flags=" << static_cast<uint32_t>(pipeline_shader_stage_create_flags)
++                      << " stage_chain=" << (pipeline_shader_create_info.pNext != nullptr)
++                      << " subgroup=" << required_subgroup_size
++                      << " pipeline_chain=" << (compute_pipeline_create_info.pNext != nullptr)
++                      << " spec=";
++            for (uint32_t value : specialization_constants) {
++                std::cerr << ' ' << value;
++            }
++            std::cerr << std::endl;
++        }
+         throw;
+     }
+ 
+@@ -2909,7 +2926,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     };
+     uint32_t rm_iq = 2 * rm_kq;
+ 
+-    const bool use_subgroups = device->subgroup_arithmetic;
++    // Opt-in compatibility probe for Adreno drivers that reject subgroup matvec pipelines.
++    const bool use_subgroups = device->subgroup_arithmetic && !getenv("GGML_VK_EXPERIMENTAL_MATVEC_SHMEM");
+     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
+     // shaders that require a subgroup size >= 16; fall back to shared-memory reduction.
+     const bool is_imagination_proprietary =
+@@ -4274,8 +4292,9 @@ vk_device ggml_vk_get_device(size_t idx) {
+         } else {
+             device->shader_core_count = 0;
+         }
+-        device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;
+-        device->float_controls_denorm_preserve_fp16 = vk12_props.shaderDenormPreserveFloat16;
++        const bool enable_fp16_float_controls = !getenv("GGML_VK_EXPERIMENTAL_NO_FP16_FLOAT_CONTROLS");
++        device->float_controls_rte_fp16 = enable_fp16_float_controls && vk12_props.shaderRoundingModeRTEFloat16;
++        device->float_controls_denorm_preserve_fp16 = enable_fp16_float_controls && vk12_props.shaderDenormPreserveFloat16;
+ 
+         device->subgroup_basic = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
+                                  (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eBasic);
+@@ -4486,6 +4505,7 @@ vk_device ggml_vk_get_device(size_t idx) {
+ 
+         VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pep_features {};
+         pep_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
++        pipeline_executable_properties_support &= !getenv("GGML_VK_EXPERIMENTAL_NO_PIPELINE_STATS");
+         if (pipeline_executable_properties_support) {
+             last_struct->pNext = (VkBaseOutStructure *)&pep_features;
+             last_struct = (VkBaseOutStructure *)&pep_features;
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index a5ab432bb423a87947e172e0815b72e7d37beca8..ca8e576464ccfc43226507c6476eff357f662ba1 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -145,8 +145,28 @@ static void clip_image_convert_f32_to_u8(const clip_image_f32& src, clip_image_u
+ #endif
+ 
+ 
++struct clip_qwen3tts_predictor {
++    bool reuse = false;
++    bool profile = false;
++    ggml_cgraph * graph = nullptr;
++    ggml_tensor * embeddings = nullptr;
++    int top_k = 0;
++    float top_p = 0;
++    ggml_context_ptr packed_ctx;
++    ggml_backend_buffer_ptr packed_weights;
++    int packed_matmuls = 0;
++    int calls = 0;
++    int builds = 0;
++    int64_t warmup_us = 0;
++    int64_t build_us = 0;
++    int64_t schedule_us = 0;
++    int64_t inference_us = 0;
++};
++
+ struct clip_ctx {
+     clip_model model;
++    std::unique_ptr<clip_ctx> qwen3tts_vocoder;
++    clip_qwen3tts_predictor qwen3tts_predictor;
+ 
+     gguf_context_ptr ctx_gguf;
+     ggml_context_ptr ctx_data;
+@@ -226,6 +246,12 @@ struct clip_ctx {
+     }
+ 
+     ~clip_ctx() {
++        const auto & stats = qwen3tts_predictor;
++        if (stats.calls > 0) {
++            LOG_INF("qwen3tts_predictor: calls=%d builds=%d warmup_us=%lld build_us=%lld schedule_us=%lld inference_us=%lld packed_matmuls=%d\n",
++                    stats.calls, stats.builds, (long long) stats.warmup_us, (long long) stats.build_us,
++                    (long long) stats.schedule_us, (long long) stats.inference_us, stats.packed_matmuls);
++        }
+         ggml_backend_free(backend);
+         if (backend != backend_cpu) {
+             ggml_backend_free(backend_cpu);
+@@ -1251,7 +1277,25 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
+                 const int   top_k = params ? params->top_k : 50;
+                 const float top_p = params ? params->top_p : 1.0f;
+-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
++                int n_wav_frames = ctx->model.hparams.wav_tfm_swa;
++                if (gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
++                    const size_t n_codes = ctx->model.gen_code_head_w->ne[2] + 1;
++                    n_wav_frames = params->codes->size() / n_codes;
++                }
++                using dac_conv = clip_graph_qwen3tts_gen::dac_conv_type;
++                auto conv = dac_conv::im2col;
++                const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx->backend));
++                const char * mode = std::getenv("MTMD_QWEN3TTS_DAC_CONV");
++                if (mode && reg && std::strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
++                    if (std::strcmp(mode, "direct") == 0) {
++                        conv = dac_conv::direct;
++                    } else if (std::strcmp(mode, "tiled") == 0) {
++                        conv = dac_conv::tiled;
++                    } else {
++                        throw std::runtime_error("MTMD_QWEN3TTS_DAC_CONV must be direct or tiled");
++                    }
++                }
++                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_wav_frames, conv);
+             } break;
+         case PROJECTOR_TYPE_SOPRANO:
+             {
+@@ -2591,6 +2635,35 @@ struct clip_model_loader {
+             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
+         }
+ 
++        auto & predictor = ctx_clip.qwen3tts_predictor;
++        ggml_backend_buffer_type_t packed_buft = nullptr;
++        bool pack_head = false;
++        const char * int8_mode = std::getenv("MTMD_QWEN3TTS_ARM_INT8");
++        if (model.proj_type == PROJECTOR_TYPE_QWEN3TTS_GEN && ctx_clip.backend == ctx_clip.backend_cpu &&
++                !ctx_clip.no_alloc && int8_mode) {
++            pack_head = std::strcmp(int8_mode, "all") == 0;
++            if (!pack_head && std::strcmp(int8_mode, "layers") != 0) {
++                throw std::runtime_error("MTMD_QWEN3TTS_ARM_INT8 must be all or layers");
++            }
++            auto * dev = ggml_backend_get_device(ctx_clip.backend_cpu);
++            auto * reg = ggml_backend_dev_backend_reg(dev);
++            auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
++                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
++            for (auto * extra = get_extra_bufts ? get_extra_bufts(dev) : nullptr; extra && *extra; ++extra) {
++                if (std::strcmp(ggml_backend_buft_name(*extra), "CPU_REPACK") == 0) {
++                    packed_buft = *extra;
++                    break;
++                }
++            }
++            if (!packed_buft) {
++                throw std::runtime_error("Qwen3-TTS ARM INT8 requires the CPU_REPACK backend");
++            }
++            predictor.packed_ctx.reset(ggml_init(params));
++            if (!predictor.packed_ctx) {
++                throw std::runtime_error("failed to create the Qwen3-TTS packed weight context");
++            }
++        }
++
+         // helper function
+         std::unordered_set<std::string> loaded_tensor_names;
+         auto get_tensor = [&](const std::string & name, bool required = true) {
+@@ -2603,9 +2676,15 @@ struct clip_model_loader {
+                 throw std::runtime_error(string_format("%s: unable to find tensor %s\n", __func__, name.c_str()));
+             }
+             if (cur) {
+-                tensors_to_load.push_back(cur);
+-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
++                const bool layer_matrix = ggml_n_dims(cur) == 2 &&
++                    (name.rfind("a.gen.code.blk.", 0) == 0 || std::strcmp(cur->name, "a.gen.code.proj_in.weight") == 0);
++                // CPU_REPACK preserves Q8_0 byte size and groups rows in fours. The 2D
++                // views of the merged head each begin on a complete row group.
++                const bool merged_head = pack_head && ggml_n_dims(cur) == 3 && std::strcmp(cur->name, "a.gen.code.head.weight") == 0;
++                const bool pack = packed_buft && cur->type == GGML_TYPE_Q8_0 && cur->ne[1] % 4 == 0 && (layer_matrix || merged_head);
++                ggml_tensor * data_tensor = ggml_dup_tensor(pack ? predictor.packed_ctx.get() : ctx_clip.ctx_data.get(), cur);
+                 ggml_set_name(data_tensor, cur->name);
++                tensors_to_load.push_back(data_tensor);
+                 loaded_tensor_names.insert(name);
+                 cur = data_tensor;
+                 // add to weight memory counter
+@@ -4742,27 +4821,51 @@ struct clip_model_loader {
+             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            if (packed_buft) {
++                predictor.packed_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(predictor.packed_ctx.get(), packed_buft));
++                if (!predictor.packed_weights) {
++                    throw std::runtime_error("failed to allocate Qwen3-TTS packed INT8 weights");
++                }
++                ggml_backend_buffer_set_usage(predictor.packed_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                int packed_count = 0;
++                for (auto * t = ggml_get_first_tensor(predictor.packed_ctx.get()); t; t = ggml_get_next_tensor(predictor.packed_ctx.get(), t)) {
++                    if (!t->extra) {
++                        throw std::runtime_error(string_format("no CPU_REPACK kernel for Qwen3-TTS tensor %s", t->name));
++                    }
++                    ++packed_count;
++                }
++                const bool head_packed = model.gen_code_head_w->buffer == predictor.packed_weights.get();
++                LOG_INF("%s: Qwen3-TTS ARM INT8 mode=%s packed %d matrices (%.2f MiB), head=%s\n", __func__, int8_mode,
++                        packed_count, ggml_backend_buffer_get_size(predictor.packed_weights.get()) / (1024.0 * 1024.0),
++                        head_packed ? "packed" : "regular");
++                if (pack_head && !head_packed) {
++                    const auto * head = model.gen_code_head_w;
++                    throw std::runtime_error(string_format("cannot pack Qwen3-TTS output head (%s, type=%s, dimensions=%d, rows=%lld)",
++                                                           head->name, ggml_type_name(head->type), ggml_n_dims(head), (long long) head->ne[1]));
++                }
++            }
+             // read the weight from file
+             if (!ctx_clip.no_alloc) {
+                 size_t data_loaded = 0;
+-                for (auto & t : tensors_to_load) {
+-                    ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
+-                    GGML_ASSERT(cur && "tensor not found in ctx_data");
+-                    auto it_off = tensor_offset.find(t->name);
++                for (auto * cur : tensors_to_load) {
++                    auto it_off = tensor_offset.find(cur->name);
+                     GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
+                     const size_t offset = it_off->second;
+                     fin.seekg(offset, std::ios::beg);
+                     if (!fin) {
+-                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
++                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, cur->name));
+                     }
+                     size_t num_bytes = ggml_nbytes(cur);
+-                    if (ggml_backend_buft_is_host(buft)) {
++                    if (cur->buffer != predictor.packed_weights.get() && ggml_backend_buft_is_host(buft)) {
+                         // for the CPU and Metal backend, we can read directly into the tensor
+                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                     } else {
+                         // read into a temporary buffer first, then copy to device memory
+                         read_buf.resize(num_bytes);
+                         fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
++                        if (!fin) {
++                            throw std::runtime_error(string_format("%s: failed to read tensor %s\n", __func__, cur->name));
++                        }
+                         ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
+                     }
+                     data_loaded += num_bytes;
+@@ -5153,6 +5256,26 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
+             // TODO: fix warmup
+             ctx_gen_audio->buf_compute_meta.resize(ctx_gen_audio->max_nodes * ggml_tensor_overhead() +
+                                                    ggml_graph_overhead_custom(ctx_gen_audio->max_nodes, false));
++
++            if (ctx_gen_audio->proj_type() == PROJECTOR_TYPE_QWEN3TTS_GEN) {
++                ctx_gen_audio->qwen3tts_predictor.profile = std::getenv("MTMD_QWEN3TTS_PROFILE_PREDICTOR") != nullptr;
++                ctx_gen_audio->qwen3tts_predictor.reuse = std::getenv("MTMD_QWEN3TTS_REUSE_PREDICTOR_GRAPH") != nullptr;
++                if (const char * name = std::getenv("MTMD_QWEN3TTS_VOCODER_DEVICE")) {
++                    auto vocoder_params = ctx_params;
++                    vocoder_params.use_gpu = true;
++                    vocoder_params.device = ggml_backend_dev_by_name(name);
++                    if (!vocoder_params.device) {
++                        throw std::runtime_error(string_format("Qwen3-TTS vocoder device '%s' not found", name));
++                    }
++                    auto vocoder = std::make_unique<clip_ctx>(vocoder_params);
++                    loader.load_hparams(vocoder->model, CLIP_MODALITY_GEN_AUDIO);
++                    loader.load_tensors(*vocoder);
++                    vocoder->buf_compute_meta.resize(ctx_gen_audio->buf_compute_meta.size());
++                    LOG_INF("%s: Qwen3-TTS code predictor on %s, code2wav on %s\n", __func__,
++                            ggml_backend_name(ctx_gen_audio->backend), ggml_backend_name(vocoder->backend));
++                    ctx_gen_audio->qwen3tts_vocoder = std::move(vocoder);
++                }
++            }
+         }
+ 
+     } catch (const std::exception & e) {
+@@ -5656,6 +5779,10 @@ clip_gen_state * clip_gen_state_init(clip_ctx * ctx, uint32_t seed) {
+     auto st = std::make_unique<clip_gen_state>();
+     st->rng.seed(seed == UINT32_MAX ? std::random_device{}() : seed);
+ 
++    // Qwen3-TTS persistent tensors belong to code2wav. The predictor only uses the RNG.
++    if (ctx->qwen3tts_vocoder) {
++        ctx = ctx->qwen3tts_vocoder.get();
++    }
+     const auto slots = list_gen_state_slots(ctx->model.hparams, ctx->model);
+     if (slots.empty()) {
+         return st.release();
+@@ -5798,8 +5925,26 @@ size_t clip_cbx_read_tensor(struct clip_ctx * ctx, const char * name, float * ou
+ }
+ 
+ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
++    if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV && ctx->qwen3tts_vocoder) {
++        ctx = ctx->qwen3tts_vocoder.get();
++    }
++    if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV && ctx->proj_type() == PROJECTOR_TYPE_QWEN3TTS_GEN) {
++        const size_t n_codes = ctx->model.gen_code_head_w->ne[2] + 1;
++        const size_t window = ctx->model.hparams.wav_tfm_swa;
++        const size_t count = params->codes ? params->codes->size() : 0;
++        if (count == 0 || count % n_codes != 0 || count / n_codes > window) {
++            LOG_ERR("%s: code2wav requires 1 to %zu complete frames\n", __func__, window);
++            return false;
++        }
++    }
+     const clip_image_f32_batch & imgs = *params->imgs;
+     int n_batch_cur = imgs.entries.size();
++    auto & predictor = ctx->qwen3tts_predictor;
++    const bool cpu_predictor = ctx->proj_type() == PROJECTOR_TYPE_QWEN3TTS_GEN &&
++                               params->gen_process == CLIP_GEN_PROCESS_GEN_CODE &&
++                               ctx->backend == ctx->backend_cpu;
++    const bool profile_predictor = cpu_predictor && predictor.profile;
++    const bool reuse_predictor = cpu_predictor && predictor.reuse && ctx->qwen3tts_vocoder;
+ 
+     // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
+     if (!ctx->support_batch && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
+@@ -5809,7 +5954,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+ 
+     // if buffers are not allocated, we need to do a warmup run to allocate them
+     if (!ctx->is_allocated) {
++        const int64_t warmup_start = profile_predictor ? ggml_time_us() : 0;
+         clip_model_loader::warmup(*ctx, *params->imgs);
++        if (profile_predictor) {
++            predictor.warmup_us += ggml_time_us() - warmup_start;
++        }
+     }
+ 
+     const bool needs_gen_state = params->gen_process == CLIP_GEN_PROCESS_GEN_CODE ||
+@@ -5828,17 +5977,47 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         }
+     }
+ 
+-    // build the inference graph
+-    ggml_backend_sched_reset(ctx->sched.get());
+-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
+-
+-    // the last node is the embedding tensor, code2wav has no out_embd
+-    // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
+-    ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+-
+-    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+-        return false;
++    ggml_cgraph * gf;
++    ggml_tensor * embeddings;
++    if (reuse_predictor && predictor.graph && predictor.top_k == params->top_k && predictor.top_p == params->top_p) {
++        gf = predictor.graph;
++        embeddings = params->out_embd ? predictor.embeddings : nullptr;
++    } else {
++        // A new build overwrites the arena used by the previous graph.
++        predictor.graph = nullptr;
++        const int64_t reset_start = profile_predictor ? ggml_time_us() : 0;
++        ggml_backend_sched_reset(ctx->sched.get());
++        const int64_t build_start = profile_predictor ? ggml_time_us() : 0;
++        gf = clip_get_graph_builder(ctx, imgs, params)->build();
++
++        // Capture the embedding before scheduling, which may reorder nodes.
++        auto * graph_embeddings = params->out_embd || reuse_predictor ? ggml_graph_node(gf, -1) : nullptr;
++        embeddings = params->out_embd ? graph_embeddings : nullptr;
++        const int64_t alloc_start = profile_predictor ? ggml_time_us() : 0;
++        if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
++            LOG_ERR("%s: failed to allocate compute graph\n", __func__);
++            return false;
++        }
++        if (profile_predictor) {
++            predictor.builds++;
++            predictor.build_us += alloc_start - build_start;
++            predictor.schedule_us += (build_start - reset_start) + (ggml_time_us() - alloc_start);
++            if (predictor.builds == 1 && predictor.packed_weights) {
++                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++                    const auto * node = ggml_graph_node(gf, i);
++                    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) && node->op == GGML_OP_MUL_MAT &&
++                            node->src[0]->buffer == predictor.packed_weights.get()) {
++                        predictor.packed_matmuls++;
++                    }
++                }
++            }
++        }
++        if (reuse_predictor) {
++            predictor.graph = gf;
++            predictor.embeddings = graph_embeddings;
++            predictor.top_k = params->top_k;
++            predictor.top_p = params->top_p;
++        }
+     }
+ 
+     // set inputs
+@@ -7014,17 +7193,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         case PROJECTOR_TYPE_QWEN3TTS_GEN:
+             {
+                 if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+-                    GGML_ASSERT(params->codes != nullptr);
+-
+-                    // frame-major input to group-major, rear-padded with code 0 up to one window
+-                    const int64_t n_codes  = model.gen_code_head_w->ne[2] + 1;
+-                    const int64_t n_frames_w = hparams.wav_tfm_swa;
+-                    const int64_t n_frames   = (int64_t) params->codes->size() / n_codes;
+-                    GGML_ASSERT(n_frames > 0 && n_frames <= n_frames_w);
+-
+-                    // codes are used as ggml_get_rows indices, so check them against the codebook vocab
++                    const int64_t n_codes = model.gen_code_head_w->ne[2] + 1;
++                    const int64_t n_frames = get_inp_tensor("inp_codes")->ne[0];
+                     const int64_t vocab_first = model.c2w.quant_first_cb_w->ne[1];
+                     const int64_t vocab_rest  = model.c2w.quant_rest_cb_w->ne[1];
++
++                    // Convert frame-major codes to group-major, checking ggml_get_rows indices.
++                    std::vector<int32_t> codes(n_frames * n_codes);
+                     for (int64_t f = 0; f < n_frames; f++) {
+                         for (int64_t g = 0; g < n_codes; g++) {
+                             const int32_t c = (*params->codes)[f * n_codes + g];
+@@ -7034,15 +7209,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                                         __func__, (long long) f, (long long) g, c, (long long) vocab);
+                                 return false;
+                             }
++                            codes[g * n_frames + f] = c;
+                         }
+                     }
+-
+-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
+-                    for (int64_t f = 0; f < n_frames; f++) {
+-                        for (int64_t g = 0; g < n_codes; g++) {
+-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
+-                        }
+-                    }
++                    LOG_INF("%s: Qwen3-TTS code2wav on %s: %lld new frames, window %d\n",
++                            __func__, ggml_backend_name(ctx->backend), (long long) n_frames, hparams.wav_tfm_swa);
+                     set_input_i32("inp_codes", codes);
+                     set_gen_state_in();
+                 } else {
+@@ -7531,7 +7702,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         }
+     }
+ 
++    const int64_t inference_start = profile_predictor ? ggml_time_us() : 0;
+     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
++    if (profile_predictor) {
++        predictor.calls++;
++        predictor.inference_us += ggml_time_us() - inference_start;
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
+         return false;
+@@ -7811,8 +7987,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+             clip_graph_soprano::decode_spectrum(model, spectrum, out_audio);
+         }
+ 
+-        // drop the tail audio that comes from the code-0 rear padding, drama3 has no padding
+-        if (model.proj_type != PROJECTOR_TYPE_DRAMA3_GEN) {
++        // Drop the tail for decoders that pad to a full window.
++        if (model.proj_type != PROJECTOR_TYPE_DRAMA3_GEN && model.proj_type != PROJECTOR_TYPE_QWEN3TTS_GEN) {
+             const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
+             const int64_t n_frames_w = hparams.wav_tfm_swa;
+             const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index 3323f0e9d13592ec7cdde53de9ac58afac39477f..83c42d4e3cb53f9b0b0473f8046f6fca8811dee5 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -344,8 +344,12 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
+ };
+ 
+ struct clip_graph_qwen3tts_gen : clip_graph {
+-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p)
+-        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
++    enum class dac_conv_type { im2col, direct, tiled };
++
++    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p,
++                           int n_wav_frames, dac_conv_type dac_conv)
++        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p), n_wav_frames(n_wav_frames),
++          dac_conv(dac_conv) {}
+     ggml_cgraph * build() override;
+ 
+     // which sub-graph build() constructs, fixed at graph-build time
+@@ -354,6 +358,8 @@ struct clip_graph_qwen3tts_gen : clip_graph {
+     // sampling params, fixed at graph-build time (GEN_CODE only)
+     int   top_k;
+     float top_p;
++    int   n_wav_frames;
++    dac_conv_type dac_conv;
+ 
+     //
+     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
+@@ -414,7 +420,8 @@ struct clip_graph_qwen3tts_gen : clip_graph {
+         mutable std::vector<std::pair<std::string, ggml_tensor *>> state_out;
+ 
+         // stateful conv ops: read/update their state via state_in/state_out[state_name]
+-        ggml_tensor * causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int dilation, const std::string & state_name) const;
++        ggml_tensor * causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int dilation,
++                                    const std::string & state_name, dac_conv_type conv = dac_conv_type::im2col) const;
+         ggml_tensor * causal_conv1d_dw(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, const std::string & state_name) const;
+         ggml_tensor * causal_conv_transpose1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int stride, const std::string & state_name) const;
+         ggml_tensor * snake(ggml_tensor * x, ggml_tensor * alpha, ggml_tensor * beta) const;
+@@ -422,13 +429,14 @@ struct clip_graph_qwen3tts_gen : clip_graph {
+         ggml_tensor * quant_decode(ggml_tensor * inp_codes) const;
+         ggml_tensor * tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, int il) const;
+         ggml_tensor * convnext_block(ggml_tensor * x, const clip_code2wav::upsample_block & blk, const std::string & state_prefix) const;
+-        ggml_tensor * dac_res_unit(ggml_tensor * x, const clip_code2wav::dac_res & res, int dilation, const std::string & state_name) const;
++        ggml_tensor * dac_res_unit(ggml_tensor * x, const clip_code2wav::dac_res & res, int dilation,
++                                    const std::string & state_name, dac_conv_type conv = dac_conv_type::im2col) const;
+ 
+         // drama3: erf GELU in ConvNeXt, not the tanh approximation
+         bool gelu_erf = false;
+ 
+         // inp_codes [1, n_codes] I32 -> this frame's audio samples [n_samples] F32, clamped to [-1, 1]
+-        ggml_tensor * decode(ggml_tensor * inp_codes) const;
++        ggml_tensor * decode(ggml_tensor * inp_codes, dac_conv_type dac_conv) const;
+     };
+ };
+ 
+diff --git a/tools/mtmd/models/qwen3tts-gen.cpp b/tools/mtmd/models/qwen3tts-gen.cpp
+index ab619b237b5aec72c0d491fec084f1a342af301a..a0fc44d2b50a27287527c9f4db9e4c50f7b69968 100644
+--- a/tools/mtmd/models/qwen3tts-gen.cpp
++++ b/tools/mtmd/models/qwen3tts-gen.cpp
+@@ -290,7 +290,8 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::step(
+ 
+ // causal conv1d, stride 1: prepend persisted left-context instead of zero-padding, then a plain conv
+ // x: [T, IC] (T-first). w: [K, IC, OC]. state_name empty means K == 1 (no left-context). returns [T, OC]
+-ggml_tensor * clip_graph_qwen3tts_gen::code2wav::causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int dilation, const std::string & state_name) const {
++ggml_tensor * clip_graph_qwen3tts_gen::code2wav::causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b,
++        int dilation, const std::string & state_name, dac_conv_type conv) const {
+     const int K   = (int) w->ne[0];
+     const int pad = (K - 1) * dilation;
+ 
+@@ -299,8 +300,27 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::causal_conv1d(ggml_tensor * x,
+         ggml_tensor * left = state_in.at(state_name); // [pad, IC]
+         x_full = ggml_concat(ctx0, left, x, 0);
+     }
+-    ggml_tensor * y = ggml_conv_1d(ctx0, w, x_full, 1, 0, dilation); // [T, OC, 1]
+-    y = ggml_reshape_2d(ctx0, y, y->ne[0], y->ne[1]);
++    constexpr int64_t tile_samples = 32768;
++    ggml_tensor * y;
++    if (conv == dac_conv_type::direct) {
++        auto * w4 = ggml_reshape_4d(ctx0, w, K, 1, w->ne[1], w->ne[2]);
++        auto * x4 = ggml_reshape_4d(ctx0, x_full, x_full->ne[0], 1, x_full->ne[1], 1);
++        y = ggml_conv_2d_direct(ctx0, w4, x4, 1, 1, 0, 0, dilation, 1);
++        ggml_set_name(y, state_name.c_str());
++        y = ggml_reshape_2d(ctx0, y, y->ne[0], y->ne[2]);
++    } else if (conv == dac_conv_type::tiled && x->ne[0] > tile_samples) {
++        y = nullptr;
++        for (int64_t offset = 0; offset < x->ne[0]; offset += tile_samples) {
++            const int64_t count = std::min(tile_samples, x->ne[0] - offset);
++            auto * view = ggml_view_2d(ctx0, x_full, count + pad, x_full->ne[1], x_full->nb[1], offset * x_full->nb[0]);
++            auto * tile = ggml_conv_1d(ctx0, w, ggml_cont(ctx0, view), 1, 0, dilation);
++            y = y ? ggml_concat(ctx0, y, tile, 0) : tile;
++        }
++        y = ggml_reshape_2d(ctx0, y, y->ne[0], y->ne[1]);
++    } else {
++        y = ggml_conv_1d(ctx0, w, x_full, 1, 0, dilation);
++        y = ggml_reshape_2d(ctx0, y, y->ne[0], y->ne[1]);
++    }
+     if (b) {
+         y = ggml_add(ctx0, y, ggml_reshape_2d(ctx0, b, 1, b->ne[0]));
+     }
+@@ -415,7 +435,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::quant_decode(ggml_tensor * inp_
+     return hidden;
+ }
+ 
+-// one pre_transformer layer over a batch of N = sliding_window new frames
++// one pre_transformer layer over a batch of N new frames
+ // attention runs over [(W-1)-frame prefix from the last batch] + [N new frames]
+ // RoPE positions come from a persisted counter, so phases line up across batches
+ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, int il) const {
+@@ -423,7 +443,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::tfm_layer_forward(ggml_tensor *
+     const int     n_head_kv = hparams.wav_tfm_n_head_kv;
+     const int64_t d_head    = layer.q_w->ne[1] / n_head;
+     const float   kq_scale  = 1.0f / sqrtf((float) d_head);
+-    const int64_t W         = hparams.wav_tfm_swa; // == N, frames per batch
++    const int64_t W         = hparams.wav_tfm_swa;
+     const int64_t N         = cur->ne[1];
+     const int64_t prefix    = W - 1;
+     const int64_t total_kv  = prefix + N;
+@@ -463,7 +483,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::tfm_layer_forward(ggml_tensor *
+     ggml_tensor * k_full = ggml_concat(ctx0, old_k, k_new, 1); // [.., prefix+N]
+     ggml_tensor * v_full = ggml_concat(ctx0, old_v, v_new, 1);
+ 
+-    // next batch's prefix: the last (W-1) frames of this batch
++    // next batch's prefix: the last (W-1) frames of the combined history
+     state_out.push_back({"tfm_k_" + std::to_string(il),
+         ggml_cont(ctx0, ggml_view_2d(ctx0, k_full, k_full->ne[0], prefix, k_full->nb[1], (size_t) N * k_full->nb[1]))});
+     state_out.push_back({"tfm_v_" + std::to_string(il),
+@@ -538,17 +558,18 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::convnext_block(ggml_tensor * x,
+ 
+ // SnakeBeta -> dilated causal conv (k=7) -> SnakeBeta -> pointwise causal conv (k=1) -> residual.
+ // x: [T, C]. returns [T, C].
+-ggml_tensor * clip_graph_qwen3tts_gen::code2wav::dac_res_unit(ggml_tensor * x, const clip_code2wav::dac_res & res, int dilation, const std::string & state_name) const {
++ggml_tensor * clip_graph_qwen3tts_gen::code2wav::dac_res_unit(ggml_tensor * x, const clip_code2wav::dac_res & res,
++        int dilation, const std::string & state_name, dac_conv_type conv) const {
+     ggml_tensor * residual = x;
+     ggml_tensor * h = snake(x, res.act1_alpha, res.act1_beta);
+-    h = causal_conv1d(h, res.conv1_w, res.conv1_b, dilation, state_name);
++    h = causal_conv1d(h, res.conv1_w, res.conv1_b, dilation, state_name, conv);
+     h = snake(h, res.act2_alpha, res.act2_beta);
+     h = causal_conv1d(h, res.conv2_w, res.conv2_b, 1, ""); // k=1, no left-context needed
+     return ggml_add(ctx0, residual, h);
+ }
+ 
+-// RVQ codes -> raw PCM for a batch of N = sliding_window frames
+-ggml_tensor * clip_graph_qwen3tts_gen::code2wav::decode(ggml_tensor * inp_codes) const {
++// RVQ codes -> raw PCM for a batch of N new frames
++ggml_tensor * clip_graph_qwen3tts_gen::code2wav::decode(ggml_tensor * inp_codes, dac_conv_type dac_conv) const {
+     const auto & c2w = model.c2w;
+ 
+     // 1. quantizer decode: N frames of 16 codes -> [512, N] (C-first)
+@@ -597,13 +618,14 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::decode(ggml_tensor * inp_codes)
+         x = snake(x, blk.snake_alpha, blk.snake_beta);
+         x = causal_conv_transpose1d(x, blk.conv_w, blk.conv_b, stride, blk_name + "_tail");
+         for (size_t ir = 0; ir < blk.res.size(); ir++) {
+-            x = dac_res_unit(x, blk.res[ir], DAC_DILATIONS[ir], blk_name + "_res" + std::to_string(ir));
++            const auto conv = il + 1 == c2w.dac.size() ? dac_conv : dac_conv_type::im2col;
++            x = dac_res_unit(x, blk.res[ir], DAC_DILATIONS[ir], blk_name + "_res" + std::to_string(ir), conv);
+         }
+         cb(x, "wav_dac_block_out", (int) il);
+     }
+ 
+     x = snake(x, c2w.dac_post_snake_alpha, c2w.dac_post_snake_beta);
+-    x = causal_conv1d(x, c2w.dac_post_conv_w, c2w.dac_post_conv_b, 1, "dac_post_conv"); // [n_samples, 1]
++    x = causal_conv1d(x, c2w.dac_post_conv_w, c2w.dac_post_conv_b, 1, "dac_post_conv", dac_conv); // [n_samples, 1]
+ 
+     x = ggml_clamp(ctx0, x, -1.0f, 1.0f);
+     x = ggml_reshape_1d(ctx0, x, x->ne[0]);
+@@ -704,7 +726,8 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
+ 
+     code_gen cg(*this, top_k, top_p);
+ 
+-    ggml_tensor * out_code_cache = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_codes);
++    ggml_tensor * code_zeros = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_codes), 0.0f);
++    ggml_tensor * out_code_cache = ggml_cast(ctx0, code_zeros, GGML_TYPE_I32);
+     out_code_cache = cg.cache_set(out_code_cache, 0, code0);
+ 
+     ggml_tensor * inp_rand0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+@@ -741,9 +764,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
+     cb(out_embd, "gen_audio_out", -1);
+ 
+     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
+-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
+-
+-    ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
++    ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_wav_frames, n_codes);
+     ggml_set_name(inp_codes, "inp_codes");
+     ggml_set_input(inp_codes);
+ 
+@@ -755,7 +776,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
+         c2w.state_in[slot.name] = t;
+     }
+ 
+-    ggml_tensor * out_audio = c2w.decode(inp_codes);
++    ggml_tensor * out_audio = c2w.decode(inp_codes, dac_conv);
+     ggml_set_name(out_audio, "out_audio");
+     ggml_set_output(out_audio);
+ 
+diff --git a/tools/mtmd/mtmd-helper-gen.cpp b/tools/mtmd/mtmd-helper-gen.cpp
+index ab5cbd424b70309367db946fe964300d73f78611..98cce64f27613e04080e0ecccfda6d44b01ee9c9 100644
+--- a/tools/mtmd/mtmd-helper-gen.cpp
++++ b/tools/mtmd/mtmd-helper-gen.cpp
+@@ -6,9 +6,13 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <functional>
++#include <future>
+ #include <memory>
+ #include <random>
+ #include <string>
+@@ -173,6 +177,17 @@ public:
+     using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
+ 
+     void reset() override {
++        if (pending_warmup.valid()) {
++            pending_warmup.wait();
++            pending_warmup = {};
++        }
++        if (pending_pcm.valid()) {
++            pending_pcm.wait();
++            pending_pcm = {};
++        }
++        wav_state.reset();
++        live_pcm.reset();
++        async_frames = 0;
+         seq_id = 0;
+         pos = 0;
+         codes_buf.clear();
+@@ -194,6 +209,36 @@ public:
+         reset();
+         seq_id = inp->seq_id;
+ 
++        if (const char * value = std::getenv("MTMD_QWEN3TTS_ASYNC_FRAMES")) {
++            char * end = nullptr;
++            const long frames = std::strtol(value, &end, 10);
++            if (end == value || *end != '\0' || frames < 1 || frames > (long) window_frames ||
++                    !std::getenv("MTMD_QWEN3TTS_VOCODER_DEVICE")) {
++                LOG_ERR("qwen3tts: async requires a separate vocoder device and a chunk size of 1 to %zu frames\n", window_frames);
++                return 1;
++            }
++            async_frames = (size_t) frames;
++            LOG_INF("qwen3tts_async: request_us=%lld chunk_frames=%zu\n", (long long) ggml_time_us(), async_frames);
++            if (const char * path = std::getenv("MTMD_QWEN3TTS_LIVE_PCM")) {
++                live_pcm.reset(std::fopen(path, "wb"));
++                if (!live_pcm) {
++                    LOG_ERR("qwen3tts: could not open live PCM sink '%s'\n", path);
++                    return 1;
++                }
++            }
++            if (!init_gen_state(inp->seed)) {
++                return 1;
++            }
++            wav_state.reset(mtmd_gen_state_init(mctx, mtmd_gen_state_params_default()));
++            if (!wav_state) {
++                LOG_ERR("qwen3tts: failed to create the vocoder state\n");
++                return 1;
++            }
++            if (std::getenv("MTMD_QWEN3TTS_VOCODER_PREWARM") && warmed_frames != async_frames && !start_vocoder_warmup()) {
++                return 1;
++            }
++        }
++
+         if (!ensure_cache()) {
+             return 1;
+         }
+@@ -275,7 +320,7 @@ public:
+         top_p = inp->top_p > 0 ? inp->top_p : def.top_p;
+         out_type = inp->out_type;
+         stream = inp->stream;
+-        if (!init_gen_state(inp->seed)) {
++        if (!async_frames && !init_gen_state(inp->seed)) {
+             return 1;
+         }
+ 
+@@ -341,7 +386,8 @@ public:
+         }
+ 
+         codes_buf.insert(codes_buf.end(), out.codes, out.codes + out.n_codes);
+-        if (out.n_codes > 0 && codes_buf.size() / out.n_codes >= window_frames) {
++        const size_t chunk_frames = async_frames ? async_frames : window_frames;
++        if (out.n_codes > 0 && codes_buf.size() / out.n_codes >= chunk_frames) {
+             if (!flush_gen_wav()) {
+                 return 1;
+             }
+@@ -374,9 +420,13 @@ public:
+ 
+         if (!stream) {
+             // one-shot call: force out whatever's left, regardless of window_frames
+-            if (!flush_gen_wav()) {
++            if (!flush_gen_wav() || !collect_pcm(true)) {
+                 return 1;
+             }
++            if (async_frames) {
++                LOG_INF("qwen3tts_async: done_us=%lld samples=%zu\n", (long long) ggml_time_us(), audio_pcm.size());
++                live_pcm.reset();
++            }
+             if (out_n_samples) {
+                 *out_n_samples = (int64_t) audio_pcm.size();
+             }
+@@ -396,6 +446,9 @@ public:
+         }
+ 
+         // streaming: only return audio produced since the previous call
++        if (!collect_pcm(false)) {
++            return 1;
++        }
+         const size_t n_new = audio_pcm.size() - pcm_sent;
+         if (out_n_samples) {
+             *out_n_samples = (int64_t) n_new;
+@@ -421,7 +474,7 @@ public:
+     }
+ 
+     int32_t flush() override {
+-        return flush_gen_wav() ? 0 : 1;
++        return flush_gen_wav() && collect_pcm(true) ? 0 : 1;
+     }
+ 
+ private:
+@@ -461,21 +514,126 @@ private:
+         return true;
+     }
+ 
+-    // one GEN_WAV process() call over the buffered codes, state is carried across batches
+-    bool flush_gen_wav() {
+-        if (codes_buf.empty()) {
++    bool collect_pcm(bool wait) {
++        if (!pending_pcm.valid() ||
++                (!wait && pending_pcm.wait_for(std::chrono::seconds(0)) != std::future_status::ready)) {
+             return true;
+         }
++        try {
++            const auto pcm = pending_pcm.get();
++            if (pcm.empty()) {
++                return false;
++            }
++            audio_pcm.insert(audio_pcm.end(), pcm.begin(), pcm.end());
++            return true;
++        } catch (const std::exception & e) {
++            LOG_ERR("qwen3tts: asynchronous decode failed: %s\n", e.what());
++            return false;
++        }
++    }
++
++    bool run_vocoder(std::vector<int32_t> & codes, mtmd_gen_state * state, mtmd_gen_out & out) {
+         mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
+         inp.type       = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
+-        inp.codes      = codes_buf.data();
+-        inp.n_codes    = codes_buf.size();
+-        mtmd_gen_out out{};
+-        if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0) {
++        inp.codes      = codes.data();
++        inp.n_codes    = codes.size();
++        if (mtmd_gen_audio_process(mctx, state, &inp, &out) != 0 || out.n_samples == 0) {
+             LOG_ERR("mtmd_helper_gen_audio: gen_wav process failed\n");
+             return false;
+         }
+-        audio_pcm.insert(audio_pcm.end(), out.audio, out.audio + out.n_samples);
++        return true;
++    }
++
++    bool start_vocoder_warmup() {
++        try {
++            pending_warmup = std::async(std::launch::async, [this]() {
++                const int64_t start_us = ggml_time_us();
++                // Qwen3-TTS has 16 codebooks. Discard the output and reset decoder history.
++                std::vector<int32_t> codes(async_frames * 16, 0);
++                mtmd_gen_out out{};
++                if (!run_vocoder(codes, wav_state.get(), out)) {
++                    return false;
++                }
++                mtmd_gen_state_reset(wav_state.get());
++                warmed_frames = async_frames;
++                LOG_INF("qwen3tts_async: warmup_start_us=%lld warmup_done_us=%lld\n",
++                        (long long) start_us, (long long) ggml_time_us());
++                return true;
++            });
++            return true;
++        } catch (const std::exception & e) {
++            LOG_ERR("qwen3tts: failed to start vocoder warmup: %s\n", e.what());
++            return false;
++        }
++    }
++
++    bool finish_vocoder_warmup() {
++        if (!pending_warmup.valid()) {
++            return true;
++        }
++        try {
++            return pending_warmup.get();
++        } catch (const std::exception & e) {
++            LOG_ERR("qwen3tts: vocoder warmup failed: %s\n", e.what());
++            return false;
++        }
++    }
++
++    // Decode one chunk. The worker alone uses wav_state and live_pcm.
++    std::vector<float> decode_chunk(std::vector<int32_t> & codes, mtmd_gen_state * state) {
++        const int64_t start_us = ggml_time_us();
++        mtmd_gen_out out{};
++        if (!run_vocoder(codes, state, out)) {
++            return {};
++        }
++        if (async_frames) {
++            LOG_INF("qwen3tts_async: decode_start_us=%lld pcm_ready_us=%lld samples=%zu\n",
++                    (long long) start_us, (long long) ggml_time_us(), out.n_samples);
++        }
++        if (live_pcm) {
++            std::vector<char> bytes;
++            bytes.reserve(out.n_samples * 2);
++            append_wav16_pcm(bytes, out.audio, out.n_samples);
++            if (std::fwrite(bytes.data(), 1, bytes.size(), live_pcm.get()) != bytes.size() ||
++                    std::fflush(live_pcm.get()) != 0) {
++                LOG_ERR("qwen3tts: live PCM write failed\n");
++                return {};
++            }
++        }
++        return {out.audio, out.audio + out.n_samples};
++    }
++
++    // Submit at most one decode ahead of the producer.
++    bool flush_gen_wav() {
++        if (codes_buf.empty()) {
++            return finish_vocoder_warmup();
++        }
++        if (async_frames) {
++            LOG_INF("qwen3tts_async: codes_ready_us=%lld codes=%zu\n", (long long) ggml_time_us(), codes_buf.size());
++            if (!collect_pcm(true)) {
++                return false;
++            }
++            std::vector<int32_t> codes;
++            codes.swap(codes_buf);
++            try {
++                pending_pcm = std::async(std::launch::async, [this, codes = std::move(codes),
++                        warmup = std::move(pending_warmup)]() mutable {
++                    if (warmup.valid() && !warmup.get()) {
++                        return std::vector<float>{};
++                    }
++                    return decode_chunk(codes, wav_state.get());
++                });
++                return true;
++            } catch (const std::exception & e) {
++                LOG_ERR("qwen3tts: failed to start vocoder worker: %s\n", e.what());
++                return false;
++            }
++        }
++        const auto pcm = decode_chunk(codes_buf, gen_state.get());
++        if (pcm.empty()) {
++            return false;
++        }
++        audio_pcm.insert(audio_pcm.end(), pcm.begin(), pcm.end());
+         codes_buf.clear();
+         return true;
+     }
+@@ -517,6 +675,13 @@ private:
+     bool   stream          = false;
+     size_t pcm_sent        = 0; // samples already returned by get_output()
+     bool   wav_header_sent = false;
++    size_t async_frames = 0;
++    size_t warmed_frames = 0;
++    mtmd::gen_state_ptr wav_state;
++    std::unique_ptr<FILE, decltype(&std::fclose)> live_pcm{nullptr, std::fclose};
++    // Join before destroying the state or sink used by the worker.
++    std::future<std::vector<float>> pending_pcm;
++    std::future<bool> pending_warmup;
+ };
+ 
+ // settings that only live in the reference's per-pack yaml, not in the checkpoint

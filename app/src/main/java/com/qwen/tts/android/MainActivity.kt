@@ -6,9 +6,11 @@ import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.AtomicFile
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -98,14 +100,17 @@ import com.qwen.tts.android.data.db.GenerationEntity
 import com.qwen.tts.android.data.db.QwenDatabase
 import com.qwen.tts.android.data.db.VoiceProfileEntity
 import com.qwen.tts.android.ui.theme.QwenTtsTheme
-import com.qwen.tts.studio.engine.QwenEngine
+import com.qwen.tts.studio.engine.LlamaTtsEngine
 import java.io.File
 import java.io.OutputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.UUID
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -118,96 +123,46 @@ import kotlinx.coroutines.withContext
 
 private data class ModelFile(
     val name: String,
-    val url: String?,
+    val url: String,
     val sizeBytes: Long,
 )
 
-private data class ModelVariant(
-    val id: String,
-    val label: String,
-    val displayName: String,
-    val files: List<ModelFile>,
-    val talkerName: String,
-) {
-    val totalBytes: Long = files.sumOf { it.sizeBytes }
-}
-
-private data class LanguageOption(val label: String, val id: Int)
-private data class BackendOption(val id: String, val label: String, val preference: Int)
+private data class LanguageOption(val label: String, val id: Int, val code: String)
+private data class BackendOption(val id: String, val label: String, val vulkan: Boolean)
 private data class GenerationTimeEstimate(val totalMillis: Long, val sampleSize: Int)
 
 private val languageOptions = listOf(
-    LanguageOption("English", 2050),
-    LanguageOption("German", 2053),
-    LanguageOption("Spanish", 2054),
-    LanguageOption("French", 2061),
-    LanguageOption("Chinese", 2055),
-    LanguageOption("Japanese", 2058),
-    LanguageOption("Korean", 2064),
-    LanguageOption("Russian", 2069),
+    LanguageOption("English", 2050, "en"),
+    LanguageOption("German", 2053, "de"),
+    LanguageOption("Spanish", 2054, "es"),
+    LanguageOption("French", 2061, "fr"),
+    LanguageOption("Chinese", 2055, "zh"),
+    LanguageOption("Japanese", 2058, "ja"),
+    LanguageOption("Korean", 2064, "ko"),
+    LanguageOption("Russian", 2069, "ru"),
 )
 
 private val backendOptions = listOf(
-    BackendOption("auto", "Auto (GPU/CPU)", QwenEngine.BACKEND_AUTO),
+    BackendOption("cpu", "CPU only", vulkan = false),
+    BackendOption("vulkan", "Vulkan vocoder", vulkan = true),
 )
 
-private val defaultBackendOption = backendOptions.first { it.id == "auto" }
-
 private object QwenModel {
-    private const val repo = "Serveurperso/Qwen3-TTS-GGUF"
-    private const val baseUrl = "https://hf-mirror.com/$repo/resolve/main"
+    private const val baseUrl = "https://hf-mirror.com/mradermacher/Qwen3-TTS-12Hz-0.6B-Base-GGUF/resolve/main"
+    const val displayName = "Qwen3-TTS 0.6B Base"
+    const val talkerName = "Qwen3-TTS-12Hz-0.6B-Base.Q4_K_M.gguf"
+    const val mmprojName = "Qwen3-TTS-12Hz-0.6B-Base.mmproj-Q8_0.gguf"
 
-    val defaultVariant: ModelVariant = variant(
-        id = "q4_k_m",
-        label = "Q4_K_M",
-        displayName = "Qwen3-TTS 0.6B Q4_K_M",
-        talkerName = "qwen-talker-0.6b-base-Q4_K_M.gguf",
-        tokenizerName = "qwen-tokenizer-12hz-Q4_K_M.gguf",
-        talkerSizeBytes = 628_905_056L,
-        tokenizerSizeBytes = 254_974_752L,
+    val files = listOf(
+        ModelFile(talkerName, "$baseUrl/$talkerName?download=true", 361_023_168L),
+        ModelFile(mmprojName, "$baseUrl/$mmprojName?download=true", 401_129_632L),
     )
-
-    val variants = listOf(defaultVariant)
-
-    val obsoleteFileNames = setOf(
-        "qwen-talker-0.6b-base-Q8_0.gguf",
-        "qwen-talker-0.6b-base-NVFP4.gguf",
-        "qwen-tokenizer-12hz-Q8_0.gguf",
-    )
-
-    // Q8_0 and NVFP4 used to be available here. The Android app now intentionally
-    // ships one supported path: Q4_K_M.
-
-    fun variantById(id: String): ModelVariant =
-        variants.firstOrNull { it.id == id } ?: defaultVariant
-
-    private fun variant(
-        id: String,
-        label: String,
-        displayName: String,
-        talkerName: String,
-        tokenizerName: String,
-        talkerSizeBytes: Long,
-        tokenizerSizeBytes: Long,
-        talkerUrl: String? = "$baseUrl/$talkerName?download=true",
-        tokenizerUrl: String? = "$baseUrl/$tokenizerName?download=true",
-    ): ModelVariant =
-        ModelVariant(
-            id = id,
-            label = label,
-            displayName = displayName,
-            talkerName = talkerName,
-            files = listOf(
-                ModelFile(tokenizerName, tokenizerUrl, tokenizerSizeBytes),
-                ModelFile(talkerName, talkerUrl, talkerSizeBytes),
-            ),
-        )
+    val totalBytes = files.sumOf { it.sizeBytes }
 }
 
 data class QwenTtsUiState(
-    val text: String = "Hello World from Qwen3 TTS running on Android on-device!",
-    val selectedModelId: String = QwenModel.defaultVariant.id,
-    val selectedBackendId: String = defaultBackendOption.id,
+    val text: String = "你好，这是手机本地语音合成测试。",
+    val selectedBackendId: String = backendOptions.first().id,
     val selectedVoiceId: String? = null,
     val activeBackendName: String? = null,
     val modelReady: Boolean = false,
@@ -216,7 +171,7 @@ data class QwenTtsUiState(
     val downloading: Boolean = false,
     val downloadProgress: Float = 0f,
     val downloadBytes: Long = 0L,
-    val downloadTotalBytes: Long = QwenModel.defaultVariant.totalBytes,
+    val downloadTotalBytes: Long = QwenModel.totalBytes,
     val status: String = "Model not downloaded",
     val error: String? = null,
     val sampleRate: Int = 0,
@@ -225,30 +180,20 @@ data class QwenTtsUiState(
     val playing: Boolean = false,
     val playingGenerationId: Long? = null,
     val operationElapsedMillis: Long = 0,
-    val synthesisFrames: Int = 0,
     val maxAudioTokens: Int = 512,
-    val cpuThreads: Int = 0,
     val selectedCpuThreads: Int = 0,
-    val selectedLanguageId: Int = 2050,
-    val tokenizeMillis: Long = 0,
-    val encodeMillis: Long = 0,
-    val generateMillis: Long = 0,
-    val decodeMillis: Long = 0,
+    val selectedLanguageId: Int = 2055,
     val decodeFrames: Int = 0,
-    val decodeSamples: Long = 0,
-    val decodeGraphComputeMillis: Long = 0,
-    val savedFileName: String? = null,
     val snackbarMessage: String? = null,
     val estimatedSynthesisMillis: Long? = null,
     val estimateSampleCount: Int = 0,
-    val supportsCloning: Boolean? = null,
-    val speakerEmbeddingDim: Int = 0,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
+    private val runtimeSettings = application.getSharedPreferences("runtime-settings", Application.MODE_PRIVATE)
     private val modelDir = File(application.filesDir, "qwen3-tts-models")
     private val voiceDir = File(application.filesDir, "voices")
-    private val generationDir = File(application.filesDir, "generations")
+    private val previewWav = AtomicFile(File(application.cacheDir, "qwen3-tts-preview.wav"))
     private val dao = QwenDatabase.getDatabase(application).qwenDao()
     private val recorder = VoiceRecorder()
 
@@ -258,13 +203,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(
         QwenTtsUiState(
-            modelReady = isModelReady(QwenModel.defaultVariant),
-            downloadTotalBytes = QwenModel.defaultVariant.totalBytes,
+            modelReady = isModelReady(),
+            selectedBackendId = backendOptionById(runtimeSettings.getString("backend", null)).id,
         ),
     )
     val uiState = _uiState.asStateFlow()
 
-    private var engine: QwenEngine? = null
+    private val engine = LlamaTtsEngine()
     private var generatedAudio: FloatArray? = null
     private var playJob: Job? = null
     private var operationTickerJob: Job? = null
@@ -272,7 +217,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         val threads = preferredCpuThreadCount()
-        _uiState.update { it.copy(selectedCpuThreads = threads, cpuThreads = threads) }
+        _uiState.update { it.copy(selectedCpuThreads = threads) }
         refreshModelState()
     }
 
@@ -281,9 +226,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateCpuThreads(value: Int) {
-        if (_uiState.value.busy) return
-        _uiState.update { it.copy(selectedCpuThreads = value, cpuThreads = value) }
-        engine?.setCpuThreads(value)
+        val current = _uiState.value
+        if (current.selectedCpuThreads != value) {
+            changeEngineConfiguration(current.selectedBackendId, value)
+        }
     }
 
     fun updateLanguage(languageId: Int) {
@@ -292,6 +238,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectVoice(voiceId: String?) {
+        if (_uiState.value.busy) return
         _uiState.update { it.copy(selectedVoiceId = voiceId) }
     }
 
@@ -299,58 +246,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(snackbarMessage = null) }
     }
 
-    fun selectModel(modelId: String) {
-        if (_uiState.value.busy || _uiState.value.selectedModelId == modelId) return
-        val variant = QwenModel.variantById(modelId)
-        stopAudio()
-        engine?.close()
-        engine = null
-        generatedAudio = null
-        val ready = isModelReady(variant)
-        _uiState.update {
-            it.copy(
-                selectedModelId = variant.id,
-                activeBackendName = null,
-                modelReady = ready,
-                loaded = false,
-                status = if (ready) "Model ready" else "Model not downloaded",
-                error = null,
-                downloadProgress = 0f,
-                downloadBytes = 0L,
-                downloadTotalBytes = variant.totalBytes,
-                sampleRate = 0,
-                sampleCount = 0,
-                synthesisMillis = 0,
-                synthesisFrames = 0,
-                tokenizeMillis = 0,
-                encodeMillis = 0,
-                generateMillis = 0,
-                decodeMillis = 0,
-                decodeFrames = 0,
-                decodeSamples = 0,
-                decodeGraphComputeMillis = 0,
-                savedFileName = null,
-                estimatedSynthesisMillis = null,
-                estimateSampleCount = 0,
-                supportsCloning = null,
-                speakerEmbeddingDim = 0,
-            )
+    fun updateBackend(backendId: String) {
+        val current = _uiState.value
+        if (current.selectedBackendId != backendId) {
+            changeEngineConfiguration(backendId, current.selectedCpuThreads)
+        }
+    }
+
+    fun unloadModel() {
+        val current = _uiState.value
+        if (current.loaded) changeEngineConfiguration(current.selectedBackendId, current.selectedCpuThreads)
+    }
+
+    private fun changeEngineConfiguration(backendId: String, threads: Int) {
+        val current = _uiState.value
+        if (current.busy) return
+        viewModelScope.launch {
+            if (current.loaded) {
+                startBusy(status = "Unloading model")
+                withContext(Dispatchers.IO) { engine.unload() }
+                stopBusyTicker()
+            }
+            runtimeSettings.edit().putString("backend", backendId).apply()
+            _uiState.update {
+                it.copy(
+                    selectedBackendId = backendId,
+                    selectedCpuThreads = threads,
+                    activeBackendName = null,
+                    busy = false,
+                    loaded = false,
+                    status = if (current.loaded) "Model unloaded" else it.status,
+                    error = null,
+                )
+            }
         }
     }
 
     fun downloadModel() {
-        if (_uiState.value.downloading) return
+        if (_uiState.value.busy) return
         viewModelScope.launch {
-            val variant = selectedVariant()
             startBusy(status = "Preparing model download", downloading = true)
             _uiState.update {
-                it.copy(downloadProgress = 0f, downloadBytes = 0L, downloadTotalBytes = variant.totalBytes)
+                it.copy(downloadProgress = 0f, downloadBytes = 0L, downloadTotalBytes = QwenModel.totalBytes)
             }
 
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     modelDir.mkdirs()
-                    downloadFiles(variant)
+                    downloadFiles()
                 }
             }
 
@@ -380,24 +323,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             startBusy(status = "Loading native model")
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    val native = ensureEngineLoaded(selectedVariant())
-                    native.getActiveBackendName().orEmpty() to native.getCpuThreads()
+                    ensureEngineLoaded()
                 }
             }
 
             result.fold(
-                onSuccess = { (backend, threads) ->
+                onSuccess = {
                     stopBusyTicker()
-                    val caps = engine?.getModelCapabilities()
                     _uiState.update {
                         it.copy(
                             busy = false,
-                            loaded = true,
-                            status = if (backend.isBlank()) "Model loaded" else "Model loaded on $backend",
-                            activeBackendName = backend.ifBlank { null },
-                            cpuThreads = threads,
-                            supportsCloning = caps?.supportsCloning,
-                            speakerEmbeddingDim = caps?.speakerEmbeddingDim ?: 0,
+                            status = "Model loaded on ${backendOptionById(it.selectedBackendId).label}",
                         )
                     }
                 },
@@ -407,6 +343,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         it.copy(
                             busy = false,
                             loaded = false,
+                            activeBackendName = null,
                             status = "Load failed",
                             error = throwable.message ?: "Load failed",
                         )
@@ -417,76 +354,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun synthesize() {
-        val text = _uiState.value.text.trim()
-        if (text.isEmpty() || _uiState.value.busy) return
+        val current = _uiState.value
+        val text = current.text.trim()
+        if (text.isEmpty() || current.busy || !current.modelReady || recorderState.value.isRecording) return
+        val voice = current.selectedVoiceId?.let { id -> voices.value.firstOrNull { it.voiceId == id } }
+        val language = languageOptions.first { it.id == current.selectedLanguageId }.code
         viewModelScope.launch {
-            val variant = selectedVariant()
-            val selectedVoice = _uiState.value.selectedVoiceId?.let { id -> voices.value.firstOrNull { it.voiceId == id } }
             val estimate = estimateSynthesisMillis(text)
-            startBusy(status = "Synthesizing speech", resetSynthesis = true, synthesisEstimate = estimate)
+            stopAudio()
+            startBusy(status = "Synthesizing speech", synthesisEstimate = estimate)
 
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    val native = ensureEngineLoaded(variant)
-                    native.setProgressCallback { frames, maxTokens ->
-                        _uiState.update {
-                            it.copy(
-                                loaded = true,
-                                status = "Generating speech codes",
-                                synthesisFrames = frames,
-                                maxAudioTokens = maxTokens,
-                            )
-                        }
+                    val reference = voice?.referenceWavPath
+                    if (current.selectedVoiceId != null) {
+                        check(reference != null && File(reference).isFile) { "The selected voice recording is missing." }
                     }
-                    try {
-                        native.synthesize(
-                            text = text,
-                            speakerEmbeddingPath = selectedVoice?.speakerEmbeddingPath,
-                            params = QwenEngine.NativeParams(languageId = _uiState.value.selectedLanguageId),
-                        )
-                    } finally {
-                        _uiState.update {
-                            it.copy(activeBackendName = native.getActiveBackendName()?.takeIf { name -> name.isNotBlank() })
-                        }
-                        native.setProgressCallback(null)
-                    }
+                    ensureEngineLoaded()
+                    val start = SystemClock.elapsedRealtime()
+                    val speech = engine.synthesize(text, reference, language, current.maxAudioTokens)
+                    val elapsed = SystemClock.elapsedRealtime() - start
+                    check(speech.audio.isNotEmpty() && speech.sampleRate > 0) { "The model returned no audio." }
+                    writePreviewWav(speech.audio, speech.sampleRate)
+                    speech to elapsed
                 }
             }
 
             result.fold(
-                onSuccess = { nativeResult ->
+                onSuccess = { (speech, elapsed) ->
                     stopBusyTicker()
-                    if (!nativeResult.success || nativeResult.audio == null) {
-                        _uiState.update {
-                            it.copy(
-                                busy = false,
-                                loaded = true,
-                                status = "Synthesis failed",
-                                error = nativeResult.errorMsg ?: "Native synthesis failed",
-                            )
-                        }
-                        return@fold
-                    }
-
-                    generatedAudio = nativeResult.audio
-                    val sampleRate = nativeResult.sampleRate.takeIf { it > 0 } ?: 24_000
-                    val voiceName = selectedVoice?.name ?: "Default Voice"
-                    persistGeneratedAudio(text, nativeResult.audio, sampleRate, voiceName, selectedVoice?.voiceId, nativeResult.timeMs)
+                    generatedAudio = speech.audio
                     _uiState.update {
                         it.copy(
                             busy = false,
-                            loaded = true,
                             status = "Speech ready",
-                            sampleRate = sampleRate,
-                            sampleCount = nativeResult.audio.size,
-                            synthesisMillis = nativeResult.timeMs,
-                            tokenizeMillis = nativeResult.tokenizeMs,
-                            encodeMillis = nativeResult.encodeMs,
-                            generateMillis = nativeResult.generateMs,
-                            decodeMillis = nativeResult.decodeMs,
-                            decodeFrames = nativeResult.decodeFrames,
-                            decodeSamples = nativeResult.decodeSamples,
-                            decodeGraphComputeMillis = nativeResult.decodeGraphComputeMs,
+                            sampleRate = speech.sampleRate,
+                            sampleCount = speech.audio.size,
+                            synthesisMillis = elapsed,
+                            decodeFrames = speech.frames,
                             estimatedSynthesisMillis = null,
                             estimateSampleCount = 0,
                             error = null,
@@ -500,6 +405,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         it.copy(
                             busy = false,
                             status = "Synthesis failed",
+                            estimatedSynthesisMillis = null,
+                            estimateSampleCount = 0,
                             error = throwable.message ?: "Synthesis failed",
                         )
                     }
@@ -517,42 +424,62 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopVoiceRecordingAndCreate(name: String) {
-        val trimmedName = name.trim().ifBlank { "Voice ${voices.value.size + 1}" }
+        if (_uiState.value.busy) return
         val result = recorder.stop() ?: return
+        saveVoiceProfile(name) { target ->
+            result.file.copyTo(target)
+            result.file.delete()
+            result.durationMillis
+        }
+    }
+
+    fun importVoice(name: String, uri: Uri) {
+        if (_uiState.value.busy || recorderState.value.isRecording) return
+        saveVoiceProfile(name) { target ->
+            val resolver = getApplication<Application>().contentResolver
+            val stream = resolver.openInputStream(uri) ?: error("Could not open the selected WAV.")
+            stream.use { input -> target.outputStream().buffered().use { output -> input.copyTo(output) } }
+            RandomAccessFile(target, "r").use { wav ->
+                require(wav.length() > 44 && wav.readInt() == 0x52494646) { "Choose a WAV file." }
+                wav.seek(8)
+                require(wav.readInt() == 0x57415645) { "Choose a WAV file." }
+            }
+            MediaMetadataRetriever().use { media ->
+                media.setDataSource(target.absolutePath)
+                media.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+                    ?.takeIf { it > 0L } ?: error("The WAV contains no readable audio.")
+            }
+        }
+    }
+
+    private fun saveVoiceProfile(name: String, saveReference: (File) -> Long) {
+        val voiceName = name.trim().ifBlank { "Voice ${voices.value.size + 1}" }
         viewModelScope.launch {
-            startBusy(status = "Creating voice embedding")
+            startBusy(status = "Saving voice recording")
             val created = runCatching {
                 withContext(Dispatchers.IO) {
-                    val native = ensureEngineLoaded(selectedVariant())
-                    val caps = native.getModelCapabilities()
-                    if (caps?.supportsCloning == false) {
-                        error("The loaded model does not expose a speaker encoder.")
-                    }
-
-                    val voiceId = "voice-${System.currentTimeMillis()}"
+                    val voiceId = "voice-${UUID.randomUUID()}"
                     val targetDir = File(voiceDir, voiceId).apply { mkdirs() }
                     val reference = File(targetDir, "reference.wav")
-                    result.file.copyTo(reference, overwrite = true)
-                    runCatching { result.file.delete() }
-
-                    val embedding = File(targetDir, "speaker.json")
-                    if (!native.extractSpeakerEmbedding(reference.absolutePath, embedding.absolutePath)) {
-                        error(native.getLastError() ?: "Speaker embedding extraction failed")
+                    val duration = try {
+                        saveReference(reference)
+                    } catch (error: Exception) {
+                        reference.delete()
+                        targetDir.delete()
+                        throw error
                     }
-
                     VoiceProfileEntity(
                         voiceId = voiceId,
-                        name = makeUniqueVoiceName(trimmedName),
+                        name = makeUniqueVoiceName(voiceName),
                         referenceWavPath = reference.absolutePath,
-                        speakerEmbeddingPath = embedding.absolutePath,
-                        durationMillis = result.durationMillis,
-                    )
+                        speakerEmbeddingPath = "",
+                        durationMillis = duration,
+                    ).also { dao.insertVoice(it) }
                 }
             }
 
             created.fold(
                 onSuccess = { voice ->
-                    dao.insertVoice(voice)
                     stopBusyTicker()
                     _uiState.update {
                         it.copy(
@@ -582,6 +509,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteVoice(voice: VoiceProfileEntity) {
+        if (_uiState.value.busy) return
         viewModelScope.launch(Dispatchers.IO) {
             dao.deleteVoice(voice)
             runCatching { File(voice.referenceWavPath).parentFile?.deleteRecursively() }
@@ -600,17 +528,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val generation = withContext(Dispatchers.IO) { dao.getGeneration(generationId) } ?: return@launch
             val loaded = runCatching { withContext(Dispatchers.IO) { readWav(generation.wavPath) } }
             loaded.onSuccess { wav ->
-                stopAudio()
-                generatedAudio = wav.samples
-                _uiState.update {
-                    it.copy(
-                        sampleRate = wav.sampleRate,
-                        sampleCount = wav.samples.size,
-                        status = "Speech ready",
-                        error = null,
-                    )
-                }
-                playAudio(generationId)
+                playSamples(wav.samples, wav.sampleRate, generationId)
             }.onFailure { throwable ->
                 _uiState.update { it.copy(error = throwable.message ?: "Could not play history item") }
             }
@@ -624,9 +542,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun playAudio(historyGenerationId: Long? = null) {
+    fun playAudio() {
         val samples = generatedAudio ?: return
-        val sampleRate = _uiState.value.sampleRate.takeIf { it > 0 } ?: 24_000
+        playSamples(samples, _uiState.value.sampleRate)
+    }
+
+    private fun playSamples(samples: FloatArray, sampleRate: Int, historyGenerationId: Long? = null) {
         stopAudio()
         playJob = viewModelScope.launch(Dispatchers.IO) {
             val track = AudioTrack.Builder()
@@ -670,30 +591,43 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(playing = false, playingGenerationId = null) }
     }
 
-    fun suggestedExportFileName(generation: GenerationEntity): String {
+    fun suggestedExportFileName(generation: GenerationEntity? = null): String {
         val formatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.US)
-        return "qwen3-tts-export-${LocalDateTime.now().format(formatter)}-${generation.generationId}.wav"
+        val timestamp = LocalDateTime.now().format(formatter)
+        return if (generation == null) "qwen3-tts-$timestamp.wav"
+        else "qwen3-tts-export-$timestamp-${generation.generationId}.wav"
+    }
+
+    fun savePreviewToUri(uri: Uri) {
+        exportWavToUri(previewWav.baseFile, uri)
     }
 
     fun exportGenerationToUri(generation: GenerationEntity, uri: Uri) {
+        exportWavToUri(File(generation.wavPath), uri)
+    }
+
+    private fun exportWavToUri(source: File, uri: Uri) {
+        if (_uiState.value.busy) return
+        startBusy(status = "Saving WAV")
         viewModelScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val resolver = getApplication<Application>().contentResolver
-                    resolver.openOutputStream(uri)?.use { output ->
-                        File(generation.wavPath).inputStream().use { input ->
+                    source.inputStream().use { input ->
+                        resolver.openOutputStream(uri, "wt")?.use { output ->
                             input.copyTo(output)
-                        }
-                    } ?: error("Could not open media output")
+                        } ?: error("Could not open media output")
+                    }
                 }
             }
+            stopBusyTicker()
             result.fold(
                 onSuccess = {
                     _uiState.update {
                         it.copy(
-                            savedFileName = null,
-                            snackbarMessage = "Export complete",
-                            status = "Exported WAV",
+                            busy = false,
+                            snackbarMessage = "WAV saved",
+                            status = "WAV saved",
                             error = null,
                         )
                     }
@@ -701,7 +635,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 onFailure = { throwable ->
                     _uiState.update {
                         it.copy(
-                            snackbarMessage = throwable.message ?: "Could not export WAV",
+                            busy = false,
+                            status = "Save failed",
+                            snackbarMessage = throwable.message ?: "Could not save WAV",
                             error = null,
                         )
                     }
@@ -710,30 +646,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun ensureEngineLoaded(variant: ModelVariant): QwenEngine {
-        val native = engine ?: QwenEngine().also { engine = it }
-        val backend = selectedBackendOption()
-        if (!native.setBackendPreference(backend.preference)) {
-            error("Could not switch backend to ${backend.label}")
+    private fun ensureEngineLoaded() {
+        val current = _uiState.value
+        if (current.loaded) return
+        val backend = backendOptionById(current.selectedBackendId)
+        val threads = current.selectedCpuThreads
+        engine.load(
+            modelPath = File(modelDir, QwenModel.talkerName).absolutePath,
+            mmprojPath = File(modelDir, QwenModel.mmprojName).absolutePath,
+            nativeLibraryDir = getApplication<Application>().applicationInfo.nativeLibraryDir,
+            vulkan = backend.vulkan,
+            threads = threads,
+        )
+        _uiState.update {
+            it.copy(loaded = true, activeBackendName = backend.label)
         }
-        val threads = selectedCpuThreadCount()
-        native.setCpuThreads(threads)
-        if (!_uiState.value.loaded) {
-            if (!native.loadModels(modelDir.absolutePath, variant.talkerName)) {
-                error(native.getLastError() ?: "Native model load failed")
-            }
-            val caps = native.getModelCapabilities()
-            _uiState.update {
-                it.copy(
-                    loaded = true,
-                    cpuThreads = native.getCpuThreads(),
-                    activeBackendName = native.getActiveBackendName()?.takeIf { name -> name.isNotBlank() },
-                    supportsCloning = caps?.supportsCloning,
-                    speakerEmbeddingDim = caps?.speakerEmbeddingDim ?: 0,
-                )
-            }
-        }
-        return native
     }
 
     private fun preferredCpuThreadCount(): Int {
@@ -745,16 +672,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun selectedCpuThreadCount(): Int =
-        _uiState.value.selectedCpuThreads.takeIf { it > 0 } ?: preferredCpuThreadCount()
-
-    private fun selectedBackendOption(): BackendOption =
-        backendOptionById(_uiState.value.selectedBackendId)
-
     private fun startBusy(
         status: String,
         downloading: Boolean = false,
-        resetSynthesis: Boolean = false,
         synthesisEstimate: GenerationTimeEstimate? = null,
     ) {
         operationTickerJob?.cancel()
@@ -766,19 +686,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 error = null,
                 status = status,
                 operationElapsedMillis = 0L,
-                synthesisFrames = if (resetSynthesis) 0 else it.synthesisFrames,
-                sampleCount = if (resetSynthesis) 0 else it.sampleCount,
-                synthesisMillis = if (resetSynthesis) 0 else it.synthesisMillis,
-                tokenizeMillis = if (resetSynthesis) 0 else it.tokenizeMillis,
-                encodeMillis = if (resetSynthesis) 0 else it.encodeMillis,
-                generateMillis = if (resetSynthesis) 0 else it.generateMillis,
-                decodeMillis = if (resetSynthesis) 0 else it.decodeMillis,
-                decodeFrames = if (resetSynthesis) 0 else it.decodeFrames,
-                decodeSamples = if (resetSynthesis) 0 else it.decodeSamples,
-                decodeGraphComputeMillis = if (resetSynthesis) 0 else it.decodeGraphComputeMillis,
-                savedFileName = if (resetSynthesis) null else it.savedFileName,
-                estimatedSynthesisMillis = synthesisEstimate?.totalMillis ?: if (resetSynthesis) null else it.estimatedSynthesisMillis,
-                estimateSampleCount = synthesisEstimate?.sampleSize ?: if (resetSynthesis) 0 else it.estimateSampleCount,
+                estimatedSynthesisMillis = synthesisEstimate?.totalMillis,
+                estimateSampleCount = synthesisEstimate?.sampleSize ?: 0,
             )
         }
         operationTickerJob = viewModelScope.launch {
@@ -823,75 +732,73 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun refreshModelState(status: String? = null) {
-        val variant = selectedVariant()
-        val ready = isModelReady(variant)
+        val ready = isModelReady()
         stopBusyTicker()
         _uiState.update {
             it.copy(
                 modelReady = ready,
                 busy = false,
                 downloading = false,
-                downloadTotalBytes = variant.totalBytes,
+                downloadTotalBytes = QwenModel.totalBytes,
                 status = status ?: if (ready) "Model ready" else "Model not downloaded",
             )
         }
     }
 
-    private fun selectedVariant(): ModelVariant =
-        QwenModel.variantById(_uiState.value.selectedModelId)
-
-    private fun isModelReady(variant: ModelVariant): Boolean =
-        variant.files.all { file ->
+    private fun isModelReady(): Boolean =
+        QwenModel.files.all { file ->
             val local = File(modelDir, file.name)
-            local.isFile && local.length() >= file.sizeBytes
+            local.isFile && local.length() == file.sizeBytes
         }
 
-    private fun downloadFiles(variant: ModelVariant) {
+    private fun downloadFiles() {
         var completedBytes = 0L
-        variant.files.forEachIndexed { index, file ->
+        QwenModel.files.forEachIndexed { index, file ->
             val target = File(modelDir, file.name)
-            if (target.isFile && target.length() >= file.sizeBytes) {
+            if (target.isFile && target.length() == file.sizeBytes) {
                 completedBytes += file.sizeBytes
                 return@forEachIndexed
             }
-            val url = file.url ?: error("${file.name} is a local experiment file. Use scripts/install_nvfp4_android.ps1 to sideload it.")
             val temp = File(modelDir, "${file.name}.download")
-            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            val connection = (URL(file.url).openConnection() as HttpURLConnection).apply {
                 instanceFollowRedirects = true
                 connectTimeout = 30_000
                 readTimeout = 30_000
             }
 
-            connection.inputStream.use { input ->
-                temp.outputStream().use { output ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    var fileBytes = 0L
-                    var lastUpdate = 0L
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        output.write(buffer, 0, read)
-                        fileBytes += read
-                        val now = System.currentTimeMillis()
-                        if (now - lastUpdate > 250L) {
-                            lastUpdate = now
-                            val total = completedBytes + fileBytes
-                            _uiState.update {
-                                it.copy(
-                                    downloadBytes = total,
-                                    downloadProgress = total.toFloat() / variant.totalBytes.toFloat(),
-                                    status = "Downloading ${index + 1}/${variant.files.size}: ${file.name}",
-                                )
+            try {
+                connection.inputStream.use { input ->
+                    temp.outputStream().use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        var fileBytes = 0L
+                        var lastUpdate = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            fileBytes += read
+                            val now = System.currentTimeMillis()
+                            if (now - lastUpdate > 250L) {
+                                lastUpdate = now
+                                val total = completedBytes + fileBytes
+                                _uiState.update {
+                                    it.copy(
+                                        downloadBytes = total,
+                                        downloadProgress = total.toFloat() / QwenModel.totalBytes.toFloat(),
+                                        status = "Downloading ${index + 1}/${QwenModel.files.size}: ${file.name}",
+                                    )
+                                }
                             }
                         }
                     }
                 }
+            } finally {
+                connection.disconnect()
             }
-            connection.disconnect()
 
-            if (temp.length() < file.sizeBytes) {
+            if (temp.length() != file.sizeBytes) {
                 temp.delete()
-                error("Downloaded ${file.name} is incomplete")
+                error("Downloaded ${file.name} has the wrong size")
             }
             if (target.exists() && !target.delete()) {
                 temp.delete()
@@ -905,29 +812,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun persistGeneratedAudio(
-        text: String,
-        samples: FloatArray,
-        sampleRate: Int,
-        voiceName: String,
-        voiceId: String?,
-        synthesisMillis: Long,
-    ) {
-        viewModelScope.launch(Dispatchers.IO) {
-            generationDir.mkdirs()
-            val file = File(generationDir, "generation-${System.currentTimeMillis()}.wav")
-            file.outputStream().use { writeWav(it, samples, sampleRate) }
-            dao.insertGeneration(
-                GenerationEntity(
-                    text = text,
-                    voiceId = voiceId,
-                    voiceName = voiceName,
-                    wavPath = file.absolutePath,
-                    sampleRate = sampleRate,
-                    sampleCount = samples.size,
-                    synthesisMillis = synthesisMillis,
-                ),
-            )
+    private fun writePreviewWav(samples: FloatArray, sampleRate: Int) {
+        val stream = previewWav.startWrite()
+        try {
+            val buffered = stream.buffered()
+            writeWav(buffered, samples, sampleRate)
+            buffered.flush()
+            previewWav.finishWrite(stream)
+        } catch (failure: Throwable) {
+            previewWav.failWrite(stream)
+            throw failure
         }
     }
 
@@ -964,8 +858,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         recorder.cancel()
         stopAudio()
         stopBusyTicker()
-        engine?.close()
-        engine = null
+        // A native call can still be finishing after viewModelScope is cancelled.
+        CoroutineScope(Dispatchers.IO).launch { engine.close() }
         super.onCleared()
     }
 }
@@ -1092,6 +986,9 @@ private fun StudioScreen(viewModel: MainViewModel) {
     val voices by viewModel.voices.collectAsState()
     var showVoicePicker by remember { mutableStateOf(false) }
     val selectedVoiceName = voices.firstOrNull { it.voiceId == state.selectedVoiceId }?.name ?: "Default Voice"
+    val saveWavLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/wav")) { uri ->
+        if (uri != null) viewModel.savePreviewToUri(uri)
+    }
 
     if (showVoicePicker) {
         VoicePickerSheet(
@@ -1130,6 +1027,7 @@ private fun StudioScreen(viewModel: MainViewModel) {
                     state = state,
                     onPlay = viewModel::playAudio,
                     onStop = viewModel::stopAudio,
+                    onSave = { saveWavLauncher.launch(viewModel.suggestedExportFileName()) },
                 )
             }
         }
@@ -1150,7 +1048,7 @@ private fun StudioScreen(viewModel: MainViewModel) {
             ) {
                 Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(if (state.busy && !state.downloading) "Generating..." else "Generate")
+                Text(if (state.busy && !state.downloading) state.status else "Generate")
             }
         }
     }
@@ -1172,6 +1070,12 @@ private fun VoicesScreen(viewModel: MainViewModel) {
         hasPermission = granted
         if (granted) viewModel.startVoiceRecording()
     }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            viewModel.importVoice(voiceName, uri)
+            voiceName = ""
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -1185,6 +1089,9 @@ private fun VoicesScreen(viewModel: MainViewModel) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Icon(Icons.Default.Mic, contentDescription = null)
                     Text("New Voice", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                }
+                state.error?.let { error ->
+                    Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
                 }
                 OutlinedTextField(
                     value = voiceName,
@@ -1227,12 +1134,12 @@ private fun VoicesScreen(viewModel: MainViewModel) {
                         Text("Cancel")
                     }
                 }
-                if (state.supportsCloning == false) {
-                    Text(
-                        "The current model does not expose voice cloning capabilities.",
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
+                OutlinedButton(
+                    onClick = { importLauncher.launch(arrayOf("audio/*")) },
+                    enabled = !state.busy && !recorderState.isRecording,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Import WAV")
                 }
             }
         }
@@ -1278,7 +1185,7 @@ private fun HistoryScreen(viewModel: MainViewModel) {
     ) {
         if (generations.isEmpty()) {
             item {
-                Text("No generated audio yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("No history items.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         items(generations, key = { it.generationId }) { generation ->
@@ -1357,13 +1264,18 @@ private fun SettingsScreen(viewModel: MainViewModel) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
+        state.error?.let { error ->
+            Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+        }
         ModelPanel(
             state = state,
             onDownload = viewModel::downloadModel,
             onLoad = viewModel::loadModel,
+            onUnload = viewModel::unloadModel,
         )
         RuntimePanel(
             state = state,
+            onBackendChange = viewModel::updateBackend,
             onCpuThreadsChange = viewModel::updateCpuThreads,
         )
     }
@@ -1530,17 +1442,17 @@ private fun ModelPanel(
     state: QwenTtsUiState,
     onDownload: () -> Unit,
     onLoad: () -> Unit,
+    onUnload: () -> Unit,
 ) {
-    val selectedVariant = QwenModel.variantById(state.selectedModelId)
     ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.GraphicEq, contentDescription = null)
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(selectedVariant.displayName, style = MaterialTheme.typography.titleMedium)
+                    Text(QwenModel.displayName, style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "${formatBytes(selectedVariant.totalBytes)} model package",
+                        "Q4_K_M + Q8_0 · ${formatBytes(QwenModel.totalBytes)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1564,11 +1476,11 @@ private fun ModelPanel(
                     Text(if (state.modelReady) "Model ready" else "Download model")
                 }
                 OutlinedButton(
-                    onClick = onLoad,
-                    enabled = state.modelReady && !state.loaded && !state.busy,
+                    onClick = if (state.loaded) onUnload else onLoad,
+                    enabled = state.modelReady && !state.busy,
                     modifier = Modifier.weight(1f),
                 ) {
-                    Text(if (state.loaded) "Loaded" else "Load")
+                    Text(if (state.loaded) "Unload" else "Load")
                 }
             }
         }
@@ -1578,6 +1490,7 @@ private fun ModelPanel(
 @Composable
 private fun RuntimePanel(
     state: QwenTtsUiState,
+    onBackendChange: (String) -> Unit,
     onCpuThreadsChange: (Int) -> Unit,
 ) {
     ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
@@ -1587,8 +1500,23 @@ private fun RuntimePanel(
                 Text("Performance", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             }
             Text(
-                state.activeBackendName?.let { "Backend: $it" } ?: "Backend: Auto (GPU/CPU)",
+                state.activeBackendName?.let { "Loaded: $it" } ?: "Model unloaded",
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                backendOptions.forEach { backend ->
+                    FilterChip(
+                        selected = state.selectedBackendId == backend.id,
+                        onClick = { onBackendChange(backend.id) },
+                        enabled = !state.busy,
+                        label = { Text(backend.label) },
+                    )
+                }
+            }
+            Text(
+                "Vulkan runs the vocoder on the GPU. Voice and speech encoding run on the CPU.",
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1606,7 +1534,7 @@ private fun RuntimePanel(
 }
 
 @Composable
-private fun ResultPanel(state: QwenTtsUiState, onPlay: () -> Unit, onStop: () -> Unit) {
+private fun ResultPanel(state: QwenTtsUiState, onPlay: () -> Unit, onStop: () -> Unit, onSave: () -> Unit) {
     ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             if (state.busy && !state.downloading) {
@@ -1635,6 +1563,13 @@ private fun ResultPanel(state: QwenTtsUiState, onPlay: () -> Unit, onStop: () ->
                     Spacer(Modifier.width(8.dp))
                     Text(if (state.playing) "Stop" else "Play")
                 }
+                OutlinedButton(
+                    onClick = onSave,
+                    enabled = state.sampleCount > 0 && !state.busy,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Save WAV")
+                }
             }
         }
     }
@@ -1642,7 +1577,6 @@ private fun ResultPanel(state: QwenTtsUiState, onPlay: () -> Unit, onStop: () ->
 
 @Composable
 private fun GenerationStats(state: QwenTtsUiState) {
-    val generatedAudioSeconds = state.synthesisFrames * 0.08
     val remainingMillis = state.estimatedSynthesisMillis
         ?.minus(state.operationElapsedMillis)
         ?.coerceAtLeast(0L)
@@ -1653,13 +1587,6 @@ private fun GenerationStats(state: QwenTtsUiState) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        if (state.synthesisFrames > 0) {
-            Text(
-                "Audio so far ~${formatSeconds(generatedAudioSeconds)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
         if (remainingMillis != null && state.estimateSampleCount >= 3) {
             Text(
                 "Estimated remaining ${formatDuration(remainingMillis)}",
@@ -1751,8 +1678,8 @@ private fun formatDate(epochMillis: Long): String {
     return date.format(java.util.Date(epochMillis))
 }
 
-private fun backendOptionById(id: String): BackendOption =
-    backendOptions.firstOrNull { it.id == id } ?: defaultBackendOption
+private fun backendOptionById(id: String?): BackendOption =
+    backendOptions.firstOrNull { it.id == id } ?: backendOptions.first()
 
 private fun OutputStream.writeAscii(value: String) {
     write(value.toByteArray(Charsets.US_ASCII))

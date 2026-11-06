@@ -20,9 +20,6 @@ interface QwenDao {
     @Query("SELECT * FROM generations ORDER BY createdAt DESC")
     fun observeGenerations(): Flow<List<GenerationEntity>>
 
-    @Insert
-    suspend fun insertGeneration(generation: GenerationEntity): Long
-
     @Query("SELECT * FROM generations WHERE generationId = :generationId")
     suspend fun getGeneration(generationId: Long): GenerationEntity?
 

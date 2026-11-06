@@ -4,50 +4,19 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
-val qwenOpenmp = providers.gradleProperty("qwen.openmp")
-    .map { it.equals("true", ignoreCase = true) }
-    .orElse(false)
-val qwenVulkan = providers.gradleProperty("qwen.vulkan")
-    .map { it.equals("true", ignoreCase = true) }
-    .orElse(false)
-val qwenOpencl = providers.gradleProperty("qwen.opencl")
-    .map { it.equals("true", ignoreCase = true) }
-    .orElse(false)
-val qwenOpenclSdkDir = providers.gradleProperty("qwen.opencl.sdkDir")
-    .orElse(layout.projectDirectory.dir("../build/opencl-sdk").asFile.absolutePath)
-val qwenPrebuiltJniDir = providers.gradleProperty("qwen.prebuiltJniDir").orNull
-val generatedOpenmpJniLibs = layout.buildDirectory.dir("generated/openmpJniLibs")
-
-val copyOpenmpLibs by tasks.registering {
-    val sdkDir = providers.environmentVariable("ANDROID_HOME")
-        .orElse(providers.environmentVariable("ANDROID_SDK_ROOT"))
-        .orElse("${System.getProperty("user.home")}\\AppData\\Local\\Android\\Sdk")
-    inputs.property("qwenOpenmp", qwenOpenmp)
-    outputs.dir(generatedOpenmpJniLibs)
-    doLast {
-        delete(generatedOpenmpJniLibs)
-        if (qwenOpenmp.get()) {
-            val libomp = fileTree("${sdkDir.get()}/ndk") {
-                include("**/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/libomp.so")
-            }.singleFile
-            copy {
-                from(libomp)
-                into(generatedOpenmpJniLibs.get().dir("arm64-v8a"))
-            }
-        }
-    }
-}
+val qwenPrebuiltJniDir = providers.gradleProperty("qwen.prebuiltJniDir")
+    .orElse("build/llamaAppRuntime")
 
 android {
     namespace = "com.qwen.tts.android"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.qwen.tts.android"
+        applicationId = "com.qwen.tts.android.llama"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1-llama"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -74,46 +43,13 @@ android {
         compose = true
     }
 
-    if (qwenPrebuiltJniDir == null) {
-        externalNativeBuild {
-            cmake {
-                path = file("src/main/cpp/CMakeLists.txt")
-            }
-        }
-
-        defaultConfig {
-            externalNativeBuild {
-                cmake {
-                    targets += listOf("qwen3_tts_jni")
-                    arguments += listOf(
-                        "-DANDROID_STL=c++_shared",
-                        "-DQWEN3_ANDROID_OPENMP=${if (qwenOpenmp.get()) "ON" else "OFF"}",
-                        "-DQWEN3_ANDROID_VULKAN=${if (qwenVulkan.get()) "ON" else "OFF"}",
-                        "-DQWEN3_ANDROID_OPENCL=${if (qwenOpencl.get()) "ON" else "OFF"}",
-                        "-DOpenCL_INCLUDE_DIR=${qwenOpenclSdkDir.get()}/OpenCL-Headers",
-                        "-DOpenCL_LIBRARY=${qwenOpenclSdkDir.get()}/lib/arm64-v8a/libOpenCL.so",
-                    )
-                }
-            }
-        }
-    }
+    // GGML discovers its backends via extracted files under nativeLibraryDir.
+    packaging.jniLibs.useLegacyPackaging = true
 
     sourceSets {
         getByName("main") {
-            if (qwenPrebuiltJniDir != null) {
-                jniLibs.srcDir(rootProject.file(qwenPrebuiltJniDir))
-            } else {
-                jniLibs.srcDir(generatedOpenmpJniLibs.get().asFile)
-            }
+            jniLibs.srcDir(rootProject.file(qwenPrebuiltJniDir.get()))
         }
-    }
-}
-
-if (qwenPrebuiltJniDir == null) {
-    tasks.matching {
-        it.name.startsWith("merge") && (it.name.endsWith("NativeLibs") || it.name.endsWith("JniLibFolders"))
-    }.configureEach {
-        dependsOn(copyOpenmpLibs)
     }
 }
 
